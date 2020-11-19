@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2015-2019, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.
 #
 # See LICENSE.txt for license information
 #
@@ -11,6 +11,7 @@ KEEP ?= 0
 DEBUG ?= 0
 TRACE ?= 0
 PROFAPI ?= 0
+NVTX ?= 1
 
 NVCC = $(CUDA_HOME)/bin/nvcc
 
@@ -23,28 +24,34 @@ CUDA_MINOR = $(shell echo $(CUDA_VERSION) | cut -d "." -f 2)
 #$(info CUDA_VERSION ${CUDA_MAJOR}.${CUDA_MINOR})
 
 
-# Better define NVCC_GENCODE in your environment to the minimal set
+# You should define NVCC_GENCODE in your environment to the minimal set
 # of archs to reduce compile time.
 CUDA8_GENCODE = -gencode=arch=compute_35,code=sm_35 \
                 -gencode=arch=compute_50,code=sm_50 \
                 -gencode=arch=compute_60,code=sm_60 \
                 -gencode=arch=compute_61,code=sm_61
 CUDA9_GENCODE = -gencode=arch=compute_70,code=sm_70
+CUDA11_GENCODE = -gencode=arch=compute_80,code=sm_80
 
 CUDA8_PTX     = -gencode=arch=compute_61,code=compute_61
 CUDA9_PTX     = -gencode=arch=compute_70,code=compute_70
+CUDA11_PTX    = -gencode=arch=compute_80,code=compute_80
 
+# Include Ampere support if we're using CUDA11 or above
+ifeq ($(shell test "0$(CUDA_MAJOR)" -ge 11; echo $$?),0)
+  NVCC_GENCODE ?= $(CUDA8_GENCODE) $(CUDA9_GENCODE) $(CUDA9_PTX) $(CUDA11_GENCODE) $(CUDA11_PTX)
 # Include Volta support if we're using CUDA9 or above
-ifeq ($(shell test "0$(CUDA_MAJOR)" -gt 8; echo $$?),0)
+else ifeq ($(shell test "0$(CUDA_MAJOR)" -ge 9; echo $$?),0)
   NVCC_GENCODE ?= $(CUDA8_GENCODE) $(CUDA9_GENCODE) $(CUDA9_PTX)
 else
   NVCC_GENCODE ?= $(CUDA8_GENCODE) $(CUDA8_PTX)
 endif
 #$(info NVCC_GENCODE is ${NVCC_GENCODE})
 
-CXXFLAGS   := -DCUDA_MAJOR=$(CUDA_MAJOR) -DCUDA_MINOR=$(CUDA_MINOR) -fPIC -fvisibility=hidden
-CXXFLAGS   += -Wall -Wno-unused-function -Wno-sign-compare -std=c++11 -Wvla
-CXXFLAGS   += -I $(CUDA_INC)
+CXXFLAGS   := -DCUDA_MAJOR=$(CUDA_MAJOR) -DCUDA_MINOR=$(CUDA_MINOR) -fPIC -fvisibility=hidden \
+              -Wall -Wno-unused-function -Wno-sign-compare -std=c++11 -Wvla \
+              -I $(CUDA_INC) \
+              $(CXXFLAGS)
 # Maxrregcount needs to be set accordingly to NCCL_MAX_NTHREADS (otherwise it will cause kernel launch errors)
 # 512 : 120, 640 : 96, 768 : 80, 1024 : 60
 # We would not have to set this if we used __launch_bounds__, but this only works on kernels, not on functions.
@@ -79,6 +86,10 @@ endif
 
 ifneq ($(TRACE), 0)
 CXXFLAGS  += -DENABLE_TRACE
+endif
+
+ifeq ($(NVTX), 0)
+CXXFLAGS  += -DNVTX_DISABLE
 endif
 
 ifneq ($(KEEP), 0)

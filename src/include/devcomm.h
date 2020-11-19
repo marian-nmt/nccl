@@ -1,5 +1,5 @@
 /*************************************************************************
- * Copyright (c) 2015-2019, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -8,18 +8,27 @@
 #define NCCL_DEVICE_H_
 
 #include "nccl.h"
+#include "align.h"
 #include <stdint.h>
+
+#define NCCL_NUM_FUNCTIONS 5 // SendRecv not included for now
+typedef enum { ncclFuncBroadcast, ncclFuncReduce, ncclFuncAllGather, ncclFuncReduceScatter, ncclFuncAllReduce, ncclFuncSendRecv} ncclFunc_t;
+extern const char* ncclFuncStr[NCCL_NUM_FUNCTIONS];
+
+#define NCCL_NUM_ALGORITHMS 3 // Tree/Ring/CollNet
+#define NCCL_ALGO_TREE 0
+#define NCCL_ALGO_RING 1
+#define NCCL_ALGO_COLLNET 2
+extern const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS];
+
+#define NCCL_NUM_PROTOCOLS 3 // Simple/LL/LL128
+#define NCCL_PROTO_LL 0
+#define NCCL_PROTO_LL128 1
+#define NCCL_PROTO_SIMPLE 2
+extern const char* ncclProtoStr[NCCL_NUM_PROTOCOLS];
 
 #define NCCL_MAX_OPS 2048
 #define NCCL_STEPS 8
-
-#define DIVUP(x, y) \
-    (((x)+(y)-1)/(y))
-#define ROUNDUP(x, y) \
-    (DIVUP((x), (y))*(y))
-
-#define ALIGN_SIZE(size, align) \
-  size = ((size + (align) - 1) / (align)) * (align);
 
 union ncclLLFifoLine {
   /* Flags have to be *after* data, because otherwise, an incomplete receive
@@ -38,12 +47,10 @@ union ncclLLFifoLine {
 
 #define WARP_SIZE 32
 #define MAXCHANNELS 32
-#define NCCL_MAX_NTHREADS 512
-#define NCCL_LL_MAX_NTHREADS NCCL_MAX_NTHREADS
+#define NCCL_MAX_NTHREADS 640
+#define NCCL_SIMPLE_MAX_NTHREADS 512
+#define NCCL_LL_MAX_NTHREADS 512
 #define NCCL_LL_LINES_PER_THREAD 8
-#define NCCL_LL_SLICE_LINES (NCCL_LL_LINES_PER_THREAD*NCCL_LL_MAX_NTHREADS)
-#define NCCL_LL_BUFF_LINES (NCCL_LL_SLICE_LINES*NCCL_STEPS)
-#define NCCL_LL_BUFF_SIZE (NCCL_LL_BUFF_LINES*sizeof(union ncclLLFifoLine))
 #ifdef TEST_LL_CLEANUP
 #define NCCL_LL_CLEAN_MASK 0x078 // Set to 0x100 to disable cleanup
 #define NCCL_LL_FLAG_MAX   0x100
@@ -66,34 +73,27 @@ static_assert(NCCL_LL_CLEAN_MASK % NCCL_STEPS == 0, "Invalid NCCL_LL_CLEAN_MASK 
 // to 3 dests. Use 70% for reduce and 30% for bcast.
 #define NCCL_LL128_SPLIT(nt) ((nt*7/(10*32))*32)
 
-#define NCCL_LL128_SLICE_ELEMS (NCCL_LL128_ELEMS_PER_THREAD*NCCL_LL128_MAX_NTHREADS)
-#define NCCL_LL128_BUFF_ELEMS (NCCL_LL128_SLICE_ELEMS*NCCL_STEPS)
-#define NCCL_LL128_BUFF_SIZE (NCCL_LL128_BUFF_ELEMS*sizeof(uint64_t))
-
 #define NCCL_LL128_SHMEM_ELEMS_PER_THREAD 8
 #define NCCL_LL128_SHMEM_SIZE (NCCL_LL128_SHMEM_ELEMS_PER_THREAD*NCCL_LL128_MAX_NTHREADS)
 
+#define NCCL_DIRECT_GPU 0x01
+#define NCCL_DIRECT_NIC 0x10
+
 struct ncclConnInfo {
   // Regular comm mechanism
-  char *buff;         // Local for recv, remote for send
+  char *buffs[NCCL_NUM_PROTOCOLS]; // Local for recv, remote for send
   uint64_t *tail;     // Local for recv, remote for send
   uint64_t *head;     // Local for send, remote for recv
-  uint64_t *opCountLoc; // opCount of local rank
-  uint64_t *opCountRem; // opCount of remote rank
 
   int direct;         // Direct communication
+  int shared;         // Buffers are shared
   void **ptrExchange; // Pointer exchange for direct communication
 
-  int *fifo;          // Size fifo for proxy
+  int *sizesFifo;     // Sizes fifo from GPU to proxy
+  void* *ptrsFifo;      // Buffer fifo from proxy to GPU
 
   uint64_t step;      // Keep where we are
-
-  // Low latency mechanism
-  union ncclLLFifoLine *llBuff; // Local for recv, remote for send
   uint64_t llLastCleaning;
-
-  // High bandwidth, low latency protocol
-  uint64_t* ll128Buff; // Local for recv, remote for send
 };
 
 struct ncclConnector {
@@ -132,80 +132,76 @@ struct ncclPeer {
 
 struct ncclDevComm;
 
-/* CollectiveArgs + ncclColl are to be a power of two, currently 64 bytes, */
+#define NCCL_MAX_WORK_ELEMENTS 8
+#define NCCL_MAX_GROUPS (NCCL_MAX_WORK_ELEMENTS*2)
+
+/* ncclWork is to be a power of two, currently 8x64 bytes, */
 /* to make sure reads to host from the CUDA kernel are aligned. */
-/* Make sure to adjust padding at the end of ncclColl. */
-struct CollectiveArgs {
+/* Make sure to adjust padding at the end of ncclWorkElem. */
+struct ncclWorkElem {
+  // Header
   struct ncclDevComm* comm;
-  uint64_t opCount;
-
-  // local and remote input, output, and buffer
-  const void * ThisInput;
-  void * ThisOutput;
-
-  // general parameters
-  size_t N;
-  uint32_t root;
-  uint8_t bid;
-  uint8_t nChannels;
   uint16_t nThreads;
+  uint16_t funcIndex;
+  uint16_t index;
+  uint16_t active;
 
-  int lastChunkSize;
-};
-struct ncclColl {
+  const void * sendbuff;
+  void * recvbuff;
+
+  // Op-specific fields.
   union {
     struct {
-      struct CollectiveArgs args;
-      uint16_t funcIndex;
-      uint16_t nextIndex;
-      uint8_t  active;
-    };
-    int data[0x10];
+      size_t count;
+      size_t lastChunkSize;
+      uint32_t root;
+      uint8_t bid;
+      uint8_t nChannels;
+    } coll;
+    struct {
+      size_t sendCount;
+      size_t recvCount;
+      int32_t delta;
+      uint16_t nThreads;
+    } p2p;
+    uint64_t align[4];
   };
 };
-static_assert(sizeof(struct ncclColl) == (0x10*sizeof(int)), "ncclColl must have a pow2 size");
+struct ncclWork {
+  struct ncclWorkElem elems[NCCL_MAX_WORK_ELEMENTS];
+};
+static_assert(sizeof(struct ncclWorkElem) == (0x10*sizeof(int)), "ncclWorkElem must have a pow2 size");
 
 struct ncclChannel {
   union {
     struct {
       struct ncclRing ring;
-      struct ncclTree treeUp;
-      struct ncclTree treeDn;
+      struct ncclTree tree;
+      struct ncclTree collTree;
 
       int id;
-      int nthreads;
-      int buffSize;
 
       // Communication structures
       struct ncclPeer* peers;
       struct ncclPeer* devPeers;
 
       // Operation list for aggregation
-      struct ncclColl* collectives;
-      struct ncclColl* devCollectives;
-      int collStart;
-      int collCount;
-      int collFifoHead; // Only used by GPU
-      int collFifoTail; // Only used by CPU
+      struct ncclWork* workFifo;
+      int workCount;
+      uint64_t workFifoTail; // Only used by CPU
     };
     int data[0x80];
   };
 };
 static_assert(sizeof(struct ncclChannel) == 0x80*sizeof(int), "ncclChannel must have a pow2 size");
 
-typedef enum {
-  ncclDevSuccess,
-  ncclDevAssertedMismatch,
-  ncclDevSuspectedMismatch
-} ncclDevError_t;
-
 struct ncclDevComm {
   int rank;
   int nRanks;
+  int buffSizes[NCCL_NUM_PROTOCOLS];
 
   // Flag to ask NCCL kernels to abort
   volatile uint32_t *abortFlag;
-  volatile ncclDevError_t *fatalDevError;
 
   // Channels, device side
   struct ncclChannel* channels;
